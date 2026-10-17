@@ -1,0 +1,557 @@
+# TÀI LIỆU PHÂN TÍCH & ĐẶC TẢ GIAO THỨC MẠNG (HTTP API & TCP SOCKET) - BẢN HOÀN CHỈNH & CHÍNH XÁC 100%
+> **Dự án:** Game Poke Android (Decompiled APK: `vn3ds_gw_250604.apk`)  
+> **Package Name:** `com.pokedaigpguanwang.vn`  
+> **Thư viện gốc:** `libHOGame.so` (Cocos2d-x / SJ::Net Engine), `libapp.so` (Flutter RyFltSDK)  
+> **Mục tiêu:** Giải mã 100% kiến trúc mạng, thuật toán chữ ký Web SDK, cấu trúc nhị phân lồng CRC32 của TCP Socket và quy trình tự động hóa.
+
+---
+
+## PHẦN 1: KIẾN TRÚC TỔNG QUAN (2-TIER PIPELINE)
+
+Hệ thống mạng của game hoạt động theo kiến trúc 2 tầng liên kết chặt chẽ. Việc tự động hóa (auto/bot/client script) bắt buộc phải tuân thủ luồng dữ liệu sau:
+
+```text
+[TẦNG 1: HTTP API Web SDK - sdk-sg.pocketgamesol.com]
+   │
+   ├─ 1. POST /register (Đăng ký tài khoản mới)
+   │     └─► Nhận về: userId (Ví dụ: 423044333) và sdk_token
+   │
+   ├─ 2. POST /login (Đăng nhập Web SDK xác thực)
+   │     └─► Nhận về: token (Ví dụ: 148108cb2b0a43968df3706895d6b7bb)
+   │
+   ▼ 
+[TẦNG 2: RAW TCP SOCKET GAME - 125.212.213.66:22142]
+   │
+   ├─ 3. Mở Socket & Gửi 16-byte Handshake lồng CRC32 (Flag 0x0A, field_12=5)
+   │     ├─► Server trả gói 1: Server Config {"sid": 2142, "status": ..., "type": "HTGame"}
+   │     └─► Server trả gói 2: ACK Handshake Header 16 byte (Flag 0x0B)
+   │
+   ├─ 4. Gói seq=1 (Login Socket)
+   │     ├─► Gửi: userid = "yuenan#" + userId (Lấy từ bước 1)
+   │     └─► Nhận về: session_key (Ví dụ: E580C76D5BBCAACA)
+   │
+   ├─ 5. Gói seq=2 (QueryAvatarAttribute)
+   │     └─► Server báo: error_code: 1 (Tài khoản mới chưa có nhân vật)
+   │
+   ├─ 6. Gói seq=4 (CreateAvatar)
+   │     ├─► Gửi: avatarName, chiefBuddy (chọn pet khởi đầu), gender
+   │     └─► Nhận về: CreateAvatarResult (error_code: 0 = Thành công, 2 = Trùng tên, 3 = Tên không hợp lệ)
+   │
+   ├─ 6.1. Gói seq=5 (QueryAvatarAttribute sau khi tạo)
+   │     └─► Nhận về: avatarid (UUID), rid (ID nhân vật hiển thị), level, coins...
+   │
+   ▼
+[QUAY LẠI TẦNG 1: HTTP API Web SDK]
+   │
+   └─ 7. POST /bindZone (Đồng bộ nhân vật về máy chủ Web)
+         ├─► Gửi: userId, gameZoneId=2142, roleId=(avatarid vừa lấy ở bước 6.1)
+         └─► Server báo: {"code": 200, "error_msg": "bind zone is success"}
+```
+
+---
+
+## PHẦN 2: TẦNG 1 - HTTP API WEB SDK (XÁC THỰC & ĐỒNG BỘ)
+
+### 2.1. Khóa Bí Mật & Băm Mật Khẩu
+* **Mật khẩu (`password`):** `MD5(raw_password)` viết thường.
+* **Secret Key SDK:** `f43968a73df747aab4b9b1e506265050` (Trích xuất từ Flutter `libapp.so`).
+* **Secret Key Game Server:** `9f87f9ca82b7e76bd1e93cc21cf37557`.
+
+### 2.2. API Đăng Ký (Register)
+* **Endpoint:** `POST https://sdk-sg.pocketgamesol.com/pocketgames/client/user/v3/register`
+* **Công thức Sign:**
+  $$\text{sign} = \text{MD5}(\text{appId} + \text{userName} + \text{passwordHash} + \text{source} + \text{SecretKey})$$
+* **Request Capture Thực Tế:**
+```http
+POST /pocketgames/client/user/v3/register?appId=10062&userName=taikhoandethu999&password=ab94285a0b9e7c9b2036c484a6a70c08&email=&thirdPartyId=&accountType=0&userChannel=0&advChannel=63&exInfo=&model=SM-S9180&operatorOs=Android14%23null%2310.1.10.1&device=UQ1A.240205.09031440&deviceNo=f81ba9d8-becc-4191-9a95-5ebd0f334210&source=1&clientTime=2026-09-25+16%3A20%3A47.978546&version=69.0.1&sdkVersion=flt_250217&network=0&sign=be5abb3b3c3e33e9365846b76a3cda01 HTTP/1.1
+Host: sdk-sg.pocketgamesol.com
+User-Agent: Dart/3.7 (dart:io)
+```
+* **Response:**
+```json
+{"data":{"emailValid":0,"firstLogin":1,"accountType":0,"userType":1,"userName":"taikhoandethu999","userId":422970263,"email":""},"token":"caa4f6f1f9974bf18c120dff59eb3158","firstLogin":false,"code":200,"error_msg":""}
+```
+
+### 2.3. API Đăng Nhập (Login)
+* **Endpoint:** `POST https://sdk-sg.pocketgamesol.com/pocketgames/client/user/v3/login`
+* **Công thức Sign:**
+  $$\text{sign} = \text{MD5}(\text{appId} + \text{userName} + \text{passwordHash} + \text{source} + \text{SecretKey})$$
+* **Request Capture Thực Tế:**
+```http
+POST /pocketgames/client/user/v3/login?appId=10062&userName=taikhoandethu999&password=ab94285a0b9e7c9b2036c484a6a70c08&advChannel=63&model=SM-S9180&operatorOs=Android14%23null%2310.1.10.1&device=UQ1A.240205.09031440&deviceNo=f81ba9d8-becc-4191-9a95-5ebd0f334210&source=1&clientTime=2026-09-25+16%3A25%3A58.205760&version=69.0.1&sdkVersion=flt_250217&network=0&sign=be5abb3b3c3e33e9365846b76a3cda01 HTTP/1.1
+Host: sdk-sg.pocketgamesol.com
+User-Agent: Dart/3.7 (dart:io)
+```
+* **Response:**
+```json
+{"data":{"emailValid":0,"firstLogin":0,"accountType":0,"userType":1,"userName":"taikhoandethu999","userId":422970263,"email":""},"token":"f11f0d10833844cf86fedcbb5a546910","firstLogin":false,"code":200,"error_msg":""}
+```
+
+### 2.4. API Đồng bộ Nhân vật (BindZone) - [ĐÃ ĐIỀU CHỈNH CHÍNH XÁC]
+> [!IMPORTANT]
+> **Điểm sửa đổi sống còn:** Trong tài liệu cũ ghi `sign = MD5(appId + userId + gameZoneId + source + SecretKey)` khiến máy chủ trả về `{"code": 503, "error_msg": "md5 check error"}`.  
+> Công thức chính xác 100% được xác minh qua chuỗi băm thực tế là:
+> $$\text{sign} = \text{MD5}(\text{userId} + \text{appId} + \text{gameZoneId} + \text{createRole} + \text{SecretKey})$$
+
+* **Kiểm chứng công thức:**
+  * `userId`: `422970893`
+  * `appId`: `10062`
+  * `gameZoneId`: `2142`
+  * `createRole`: `1`
+  * `SecretKey`: `f43968a73df747aab4b9b1e506265050`
+  * Chuỗi ghép: `4229708931006221421f43968a73df747aab4b9b1e506265050`
+  * $\text{MD5} \rightarrow$ **`70d29a9fba108e81cf5c260c77093692`** *(Khớp chính xác từng ký tự với gói tin bên dưới!)*
+
+* **Endpoint:** `POST https://sdk-sg.pocketgamesol.com/pocketgames/client/user/v3/bindZone`
+* **Request Capture Thực Tế:**
+```http
+POST /pocketgames/client/user/v3/bindZone?appId=10062&userId=422970893&gameZoneId=2142&createRole=1&advChannel=63&roleId=44facfd6-f756-4a1f-ad3b-9dd4931eb0c3&level=1&model=SM-S9180&operatorOs=Android14%23null%2310.1.10.1&device=UQ1A.240205.09031440&deviceNo=f81ba9d8-becc-4191-9a95-5ebd0f334210&source=1&clientTime=2026-09-25+16%3A28%3A13.129288&version=69.0.1&sdkVersion=flt_250217&network=0&sign=70d29a9fba108e81cf5c260c77093692 HTTP/1.1
+Host: sdk-sg.pocketgamesol.com
+User-Agent: Dart/3.7 (dart:io)
+```
+* **Response:**
+```json
+{"code":200,"error_msg":"bind zone is success"}
+```
+
+### 2.5. API Web Event - Nhận Quà Nâng Cấp Tài Khoản (20 Phiếu Ấp)
+
+Hệ thống sự kiện Web Event của JoyGame (`activity.pocketgamesol.com`) dùng để tặng 20 vé quay gacha (Item ID `80262`) gửi trực tiếp vào hòm thư ingame.
+
+#### 1. Đăng nhập Web Sự Kiện (Web SDK Login)
+* **Endpoint:** `GET https://activity.pocketgamesol.com/user/sdk/login`
+* **Công thức Sign:**
+  $$\text{sign} = \text{MD5}(\text{userName} + \text{MD5}(\text{raw\_password}) + \text{"v3\_pokectgame\_login"})$$
+  *(Lưu ý: Chuỗi secret có chữ `pokectgame` do nhà phát triển gõ sai chính tả nguyên bản).*
+* **Query Params:**
+  * `userName`: Tên tài khoản
+  * `password`: Mã MD5 của mật khẩu gốc viết thường
+  * `version`: `"v3"`
+  * `sign`: Mã băm MD5 theo công thức trên
+* **Response:**
+  ```json
+  {"code":200,"state":{"userId":"423045673","userName":"yogurttester090","token":"bc9f0ac6-9634-44f4-8646-875eb7912d4c"}}
+  ```
+
+#### 2. Nhận Thưởng 20 Phiếu Ấp (Claim Reward)
+* **Endpoint:** `GET https://activity.pocketgamesol.com/activity/getUserReward`
+* **Query Params:**
+  * `groupId`: `5f682ae8b5cb673c9ca740ed`
+  * `actId`: `5f682ae8b5cb673c9ca740ee`
+  * `token`: Mã `token` nhận được từ phản hồi Login ở trên
+  * `rewardId`: `5f682ae8b5cb673c9ca740ef`
+* **Response Thành Công:**
+  ```json
+  {"code":200,"state":{"rewardName":"Thưởng nâng cấp tk du khách","rewardId":"5f682ae8b5cb673c9ca740ef","getDate":"2026-09-26"}}
+  ```
+  *(Sau khi gọi API này, hệ thống sẽ tự động gửi 1 thư mang tiêu đề "Thưởng nâng cấp tk du khách" chứa 20 vé ấp vào hòm thư trong game).*
+
+---
+
+## PHẦN 3: TẦNG 2 - RAW TCP SOCKET (LOGIC TRẬN ĐẤU)
+
+### 3.1. Cấu hình Hạ tầng
+* **IP Server:** `125.212.213.66` (Server Việt Nam).
+* **Port:** `22142` (Quy luật Port = 20000 + ServerID).
+* **Giao thức:** Raw TCP Socket thuần (Duy trì kết nối hai chiều liên tục).
+
+---
+
+### 3.2. Cấu Trúc Header Nhị Phân 16-Bytes (Packet Framing) - [ĐÃ GIẢI MÃ HOÀN TOÀN]
+
+> [!CAUTION]
+> **Phát hiện dịch ngược đặc biệt quan trọng (Reverse Engineered từ `libHOGame.so`):**  
+> Bốn byte đầu tiên (`Byte 0 – 3`) **KHÔNG PHẢI LÀ MAGIC ID CỐ ĐỊNH**. Nếu client gửi các giá trị tĩnh như `08 11 84 92` hoặc `49 c5 24 fc` với độ dài payload khác nhau, server sẽ **ngắt kết nối TCP ngay lập tức** (Disconnect at byte 15) do kiểm tra mã checksum thất bại!  
+> Bản chất của 16-byte Header là hệ thống **kiểm tra toàn vẹn lồng 2 tầng CRC32 (Nested CRC32 Checksum)** của engine `SJ::Net::Message::encode`.
+
+#### Bảng Cấu Trúc Chi Tiết 16 Byte Header:
+
+| Vị trí Byte | Kiểu dữ liệu / Endian | Tên trường | Ý nghĩa & Quy luật tính toán |
+| :---: | :---: | :--- | :--- |
+| **Byte 0 – 1** | `uint16` (Big-Endian) | **Header Checksum (`crc2`)** | $\text{CRC32}(\text{Header}[2:16]) \ \& \ \text{0xFFFF}$. Tính CRC trên 14 byte sau của chính Header. |
+| **Byte 2 – 3** | `uint16` (Big-Endian) | **Body Checksum (`crc1`)** | $\text{CRC32}(\text{Packet}[4:]) \ \& \ \text{0xFFFF}$. Tính CRC từ byte 4 đến hết toàn bộ payload. |
+| **Byte 4 – 6** | `uint24` (3 Bytes Big-Endian) | **Packet Length** | Tổng độ dài toàn bộ gói tin = $16 + \text{len(payload)}$. |
+| **Byte 7** | `uint8` (1 Byte) | **Packet Flag** | `0x0A`: Gói Handshake khởi tạo kết nối.<br>`0x00`: Gói dữ liệu ứng dụng thông thường.<br>`0x0B`: Gói Handshake ACK (Server trả lời). |
+| **Byte 8 – 11** | `uint32` (Big-Endian) | **Field 8** | Mặc định `0x00000000` đối với gói gửi lên. |
+| **Byte 12 – 15** | `uint32` (Big-Endian) | **Field 12 / Version** | `0x00000005` (số 5) đối với gói Handshake (Protocol v5).<br>`0x00000000` đối với các gói dữ liệu tiếp theo. |
+
+#### Minh chứng toán học giải thích gói Handshake thực tế:
+* Gói Handshake không có payload: `len(payload) = 0`, `total_len = 16` (`0x00 0x00 0x10`).
+* `Byte 4..15`: `00 00 10 0a 00 00 00 00 00 00 00 05`
+* Bước 1: $\text{CRC32}(\text{packet}[4:]) = \text{0xB93F3996} \rightarrow \text{Byte 2..3} = \mathbf{39 \ 96}$
+* Bước 2: Ghép `Byte 2..15`: `39 96 00 00 10 0a 00 00 00 00 00 00 00 05`
+* Bước 3: $\text{CRC32}(\text{packet}[2:16]) = \text{0xA25961DA} \rightarrow \text{Byte 0..1} = \mathbf{61 \ DA}$
+* Kết quả ghép hoàn chỉnh:
+  $$\mathbf{61 \ da \ 39 \ 96 \ 00 \ 00 \ 10 \ 0a \ 00 \ 00 \ 00 \ 00 \ 00 \ 00 \ 00 \ 05}$$
+  *(Trùng khớp 100% từng bit với gói Handshake bắt được trong Wireshark!)*
+
+---
+
+### 3.3. Định dạng Body (Payload)
+Phần body theo sau 16-byte Header là chuỗi URL Query String gồm 6 tham số:
+```text
+bv=70.0.0&request=[JSON_ENCODED]&seq=[SO_THU_TU]&session=[MA_PHIEN]&sptype=spyuenan_md&version=73.0.0
+```
+* **`request`:** Mảng JSON các câu lệnh cần thực hiện, được mã hóa URL bằng `urllib.parse.quote()`.
+* **`seq`:** Số thứ tự gói tin tăng dần (1, 2, 4,...).
+* **`session`:** Chuỗi `session_key` nhận được từ phản hồi `LoginResult`. Với gói `Login` (seq=1), trường này để trống `session=`.
+* **Tiền tố UserID:** Trong mảng JSON của gói `Login`, `userId` lấy từ Web SDK phải được gắn thêm tiền tố `"yuenan#"`.  
+  Ví dụ: `"userid": "yuenan#423044333"`.
+
+---
+
+### 3.4. Thuật toán Giải nén Phản hồi (Zlib Deflate)
+Các gói tin server gửi về có 2 dạng:
+1. **Dạng thường:** Chuỗi văn bản bắt đầu bằng mã trạng thái `0;` đi kèm mảng JSON.
+2. **Dạng nén:** Dữ liệu dung lượng lớn (Danh sách Pet, Bảng xếp hạng...) bắt đầu bằng 2 byte nhận diện Zlib Deflate (`0x78 0x9C` hoặc `0x78 0xDA`).  
+   $\rightarrow$ Client giải nén bằng `zlib.decompress(payload)` trước khi parse JSON.
+
+---
+
+### 3.5. Quy Trình Khởi Tạo & Tạo Nhân Vật (Chi Tiết Gói Tin)
+
+#### 1. Bắt tay Handshake (Client $\rightarrow$ Server):
+* Client gửi 16 byte Handshake (`Flag 0x0A`, `field_12 = 5`).
+* **Server trả về 2 gói tuần tự:**
+  * Gói 1: Thông tin cấu hình Server:
+    ```json
+    {"sid":2142,"status":1790403002,"innerAddr":"/0.0.0.0:22142","launchInfo":"[\"-config\",\"/data/game2142/config.prop\"]","number":0,"innerCount":13,"type":"HTGame","para":"[2142]"}
+    ```
+  * Gói 2: Xác nhận Handshake ACK (16 byte header, `Flag 0x0B`, payload 0 byte).
+
+#### 2. Gói seq=1 (Login Socket):
+* **Client gửi:**
+  ```json
+  [{"deviceType":2,"func":"Login","info":"{\"appVersion\":\"73.0.0\",\"appBaseVersion\":\"70.0.0\",\"deviceId\":\"DEVICE#...\",\"model\":\"SM-S9180\",\"os\":\"Android\"}","serverid":2142,"userid":"yuenan#423044333"}]
+  ```
+* **Server trả về:**
+  ```json
+  0;[{"func":"LoginResult","session_key":"E580C76D5BBCAACA"}]
+  ```
+
+#### 3. Gói seq=2 (QueryAvatarAttribute):
+* **Client gửi:** `[{"func":"QueryAvatarAttribute"}]` (mang theo `session=E580C76D5BBCAACA`).
+* **Server trả về (Tài khoản mới):**
+  ```json
+  0;[{"attribute":{"createTime":0,"avatarName":"","level":0...},"error_code":1,"avatarid":"","func":"QueryAvatarAttributeResult"}]
+  ```
+  *(Mã `error_code: 1` xác nhận tài khoản chưa có nhân vật).*
+
+#### 4. Gói seq=4 (CreateAvatar):
+* **Client gửi:**
+  ```json
+  [{"avatarName":"LOb977","chiefBuddy":1002,"func":"CreateAvatar","gender":0}]
+  ```
+* **Danh sách tùy chọn nhân vật khởi tạo:**
+  * `chiefBuddy` (Pokémon đồng hành ban đầu):
+    * `1000`: Bulbasaur / Fushigidane (Hệ Cỏ / Grass)
+    * `1001`: Squirtle / Zenigame (Hệ Nước / Water)
+    * `1002`: Charmander / Hitokage (Hệ Lửa / Fire)
+  * `gender` (Giới tính nhân vật): `0` = Nam (Boy), `1` = Nữ (Girl)
+  * `avatarName`: Tên nhân vật (2 - 12 ký tự, chỉ gồm chữ cái và số, không chứa ký tự đặc biệt như `_`, `-`, khoảng trắng).
+* **Server trả về:**
+  ```json
+  0;[{"error_code":0,"func":"CreateAvatarResult"}]
+  ```
+* **Bảng Mã Lỗi `CreateAvatarResult`:**
+  * `error_code: 0`: Tạo nhân vật thành công.
+  * `error_code: 2`: **Tên nhân vật đã tồn tại trên Server** (Trùng tên). Cần đổi tên khác và thử lại.
+  * `error_code: 3`: **Tên không hợp lệ** (Chứa ký tự cấm như `_`, khoảng trắng hoặc độ dài sai).
+
+#### 5. Gói seq=5 (QueryAvatarAttribute lấy thông tin định danh):
+Ngay sau khi nhận `CreateAvatarResult` thành công, Client bắt buộc gửi tiếp `QueryAvatarAttribute` để lấy UUID:
+* **Server trả về:**
+  ```json
+  0;[{"attribute":{"createTime":1790403002,"avatarName":"LOb977","level":1,"figureID":1002,"rid":142129994...},"error_code":0,"avatarid":"51ccf91b-e5c0-4e13-9c0d-da59abac9651","func":"QueryAvatarAttributeResult"}]
+  ```
+  * `avatarid`: **`51ccf91b-e5c0-4e13-9c0d-da59abac9651`** (UUID dùng để truyền vào tham số `roleId` khi gọi `POST /bindZone`).
+  * `rid`: **`142129994`** (Mã ID số hiển thị trong game).
+
+---
+
+### 3.6. Cơ Chế Giữ Kết Nối Định Kỳ (Heartbeat / Ping-Pong)
+Máy chủ TCP Game sẽ tự động đóng kết nối (Socket Reset / Disconnect) nếu đường truyền không có dữ liệu qua lại trong 60 giây. Client cần duy trì cơ chế Heartbeat định kỳ:
+* **Gói tin Client gửi:**
+  ```json
+  [{"func":"HeartBeat"}]
+  ```
+* **Body đóng gói URL Query String:**
+  ```text
+  bv=70.0.0&request=%5B%7B%22func%22%3A%22HeartBeat%22%7D%5D&seq=[seq]&session=[session_key]&sptype=spyuenan_md&version=73.0.0
+  ```
+* **Header:** 16 byte Header với `Flag 0x00`, `field_8 = 0`, `field_12 = 0`.
+* **Server phản hồi:**
+  ```json
+  0;[{"func":"HeartBeatResult","serverTime":1790403150}]
+  ```
+* **Tần suất khuyến nghị:** Gửi lặp lại mỗi 25 – 30 giây trong một tiến trình nền (Background Thread / Timer).
+
+---
+
+### 3.7. Kỹ Thuật Đọc Luồng TCP & Bẫy Lệch Gói Cần Tránh (Critical Traps)
+
+> [!WARNING]
+> Đây là các nguyên nhân phổ biến nhất khiến bot/script bị kẹt kết nối hoặc crash mà tài liệu thông thường không đề cập:
+
+1. **Bẫy lệch gói khi Bắt tay Handshake (Crucial Desync Trap):**
+   * Ngay khi Client gửi gói 16-byte Handshake (`Flag 0x0A`), Server sẽ phản hồi **liên tiếp 2 gói tin TCP tách rời**:
+     * **Gói 1:** JSON cấu hình máy chủ (`{"sid":2142,...}`).
+     * **Gói 2:** Header 16-byte xác nhận Handshake ACK (`Flag 0x0B`, độ dài payload = 0).
+   * **Sai lầm:** Nếu Client chỉ gọi hàm nhận 1 lần rồi gửi luôn gói `Login` (seq=1), thì khi đọc phản hồi của Login, Client sẽ đọc trúng Gói 2 (Handshake ACK) thay vì `LoginResult` $\rightarrow$ Toàn bộ luồng sau đó bị lệch pha và mất đồng bộ!
+   * **Cách xử lý đúng:** Phải đọc đủ cả 2 gói tin TCP trước khi bắt đầu gửi gói `Login` (seq=1).
+
+2. **Phân biệt `roleId` và `rid` khi gọi `bindZone` Web SDK:**
+   * Sau khi tạo nhân vật thành công ở gói `seq=4`, gói `CreateAvatarResult` **KHÔNG** chứa ID hay UUID của nhân vật.
+   * Client bắt buộc phải gửi tiếp gói `seq=5` (`QueryAvatarAttribute`) để Server trả về `avatarid` (UUID dạng chuỗi như `51ccf91b-e5c0-4e13-9c0d-da59abac9651`) và `rid` (ID số hiển thị như `142129994`).
+   * Khi gọi `POST /bindZone`, tham số `roleId` **bắt buộc phải là chuỗi UUID `avatarid`**, tuyệt đối không truyền số `rid` hiển thị (nếu truyền số `rid` hệ thống Web SDK sẽ không ánh xạ đúng).
+
+3. **Xử lý phân mảnh luồng TCP (TCP Stream Reassembly):**
+   * Do đặc tính phân mảnh của giao thức TCP, một gói dữ liệu lớn (như phản hồi danh sách pet zlib) có thể đến trong nhiều chunk mạng.
+   * Client bắt buộc phải đọc đúng 16 byte đầu tiên, trích xuất độ dài `total_len = int.from_bytes(header[4:7], 'big')`, sau đó chạy vòng lặp nhận cho đến khi đủ `payload_len = total_len - 16` bytes thì mới bắt đầu giải nén Zlib và parse JSON.
+
+---
+
+## PHẦN 4: THEO DÕI HÀNH ĐỘNG THỰC TẾ (GACHA TRACE)
+* **Nhân vật:** `Land998` (Role ID: 142127502)
+* **Session Key:** `6A333BE6B8D16A43`
+
+| STT Gói (`seq`) | Tên hành động / API (`func`) | Dữ liệu gửi đi (Request Payload) | Phản hồi từ Server (Response Content) | Tính năng & Ý nghĩa của gói |
+| :---: | :--- | :--- | :--- | :--- |
+| **1** | `Login` | `[{"deviceType":2,"func":"Login","info":"...","serverid":2142,"userid":"yuenan#422972963"}]` | `[{"func":"LoginResult","session_key":"6A333BE6B8D16A43"}]` | **Đăng nhập:** Xác thực tài khoản với máy chủ và nhận Session Token. |
+| **144** | `NotifyMailUpdate` | *(Server push)* | `[{"func":"NotifyMailUpdate"}]` | **Thông báo thư:** Tín hiệu có thư mới. |
+| **145** | `QueryMailBox` | `[{"func":"QueryMailBox"}]` | `[{"func":"QueryMailBoxResult","mails":[{"id":"6c363eb6-...","subject":"Thưởng nâng cấp tk du khách","attachment":{"items":[{"contentID":80262,"count":20}]}}]}]` | **Check thư:** Tìm thấy thư đính kèm **20 vé quay gacha** (ID `80262`). |
+| **146** | `ObtainAttachment` | `[{"func":"ObtainAttachment","mailid":"6c363eb6-9756..."}]` | `[{"func":"UpdateItem","item":{"contentID":80262,"count":20}},{"func":"ObtainAttachmentResult","error_code":0}]` | **Nhận quà từ thư:** Lấy 20 vé quay `80262` cộng vào túi đồ. |
+| **150** | `LotteryConsume` | `[{"func":"LotteryConsume","lotteryType":1003}]` | `[{"func":"ServerAddPetResult","pet":{"PetConfigID":20461,"name":"Charmander","petId":1,"Fighting":1391}}]` | **Quay Free:** Nhận được Pet **Charmander** (Pet ID: 1). |
+| **151** | `SetCityInfo` | `[{"city":201,"equipShow":[],"func":"SetCityInfo","mount_ID":0,"pet_ID":1,"pos":0}]` | *(Xác nhận cập nhật trạng thái hiển thị)* | **Cài đặt Pet:** Chọn Charmander làm Pet chạy theo. |
+| **153** | `LotteryConsume` | `[{"func":"LotteryConsume","lotteryType":1004}]` | - Giảm 10 vé: `item 80262` còn `10`<br>- Nhận 4 Pet: **Tangela** (ID 2), **Snivy** (ID 3), **Sylveon** (ID 4), **Mareanie** (ID 5). | **Quay x10:** Tiêu hao 10 vé quay, nhận 4 Pokémon và vật phẩm. |
+| **155** | `AchievementVerify` | `[{"achieveId":20801,"func":"AchievementVerify"}]` | `[{"achieveId":20801,"error_code":0,"func":"AchievementVerifyResult"}]` | **Nhận thành tựu:** Xác nhận mốc thành tựu sưu tập Pet. |
+| **159** | `LotteryConsume` | `[{"func":"LotteryConsume","lotteryType":1003}]` | Nhận: 2 Mảnh Pet `91601` (Mảnh Sylveon). | **Quay x1 lần 1:** Không ra Pet, nhận 2 mảnh ghép. |
+| **163** | `LotteryConsume` | `[{"func":"LotteryConsume","lotteryType":1003}]` | Thêm Pet: **Sylveon** (Pet ID: 6, LC: 1782, Config ID: 21601). | **Quay x1 lần 2:** Mở khóa thêm 1 Pet **Sylveon** thứ 2. |
+| **166** | `LotteryConsume` | `[{"func":"LotteryConsume","lotteryType":1003}]` | Thêm Pet: **Dewpider** (Pet ID: 7, LC: 1270, Config ID: 22251). | **Quay x1 lần 3:** Nhận Pet **Dewpider**. |
+| **169** | `LotteryConsume` | `[{"func":"LotteryConsume","lotteryType":1003}]` | Nhận vật phẩm ID `30110` x1. | **Quay x1 lần 4:** Nhận vật phẩm bổ trợ. |
+| **173** | `LotteryConsume` | `[{"func":"LotteryConsume","lotteryType":1003}]` | Thêm Pet: **Electrike** (Pet ID: 8, LC: 1583, Config ID: 21161). | **Quay x1 lần 5:** Nhận Pet **Electrike**. |
+| **176** | `LotteryConsume` | `[{"func":"LotteryConsume","lotteryType":1003}]` | Thêm Pet: **Weedle** (Pet ID: 9, LC: 1568, Config ID: 21201). | **Quay x1 lần 6:** Nhận Pet **Weedle**. |
+| **180** | `LotteryConsume` | `[{"func":"LotteryConsume","lotteryType":1003}]` | Nhận: 1 Mảnh Pet `91601` (tổng 3 mảnh). | **Quay x1 lần 7:** Nhận thêm mảnh ghép. |
+| **183** | `LotteryConsume` | `[{"func":"LotteryConsume","lotteryType":1003}]` | Thêm Pet: **Gulpin** (Pet ID: 10, LC: 1565, Config ID: 23491). | **Quay x1 lần 8:** Nhận Pet **Gulpin**. |
+| **186** | `LotteryConsume` | `[{"func":"LotteryConsume","lotteryType":1003}]` | Thêm Pet: **Virizion** (Pet ID: 11, LC: 2228, Config ID: 21501). | **Quay x1 lần 9:** Nhận Pet Huyền Thoại **Virizion**. |
+
+---
+
+## PHẦN 5: TỪ ĐIỂN MÃ LỆNH API GAME (API DICTIONARY)
+
+### 5.1. Nhóm Xác thực, Kết nối & Hệ thống (System)
+`Login`, `HeartBeat`, `NotifyMailUpdate`, `ShareObjectUpdate / Broadcast`, `StatisticsQuery`, `QueryOA`.
+
+### 5.2. Nhóm Nhân vật, Túi đồ & Phát triển (Avatar)
+`QueryAvatarAttribute`, `QueryAvatarItems`, `SetCityInfo`, `GetChengHaoList`, `GetHuiZhangList / UpdateHuiZhang`, `HeadFrameQuery / DongtaiHeadQuery`, `WaiguanQuery`, `QueryGuideRecord`, `QueryDailyProgress`, `LivenessQuery`, `TaskQuery`, `AchievementQuery / AchievementVerify`, `QueryQianDao`, `RecoverQuery`.
+
+### 5.3. Nhóm Thư từ, Nạp tiền & Phúc lợi (Mail, Shop & VIP)
+`QueryMailBox`, `ObtainAttachment`, `QueryAllChargeConfig`, `QueryChargeInfo`, `QueryChargePromoteRecord`, `QueryVipLiBaoDraw`, `ReturnGiftQuery`, `OnceRewardQuery`, `ExchangeShopQuery`, `LilyAiQuery`.
+
+### 5.4. Nhóm Pet, Nuôi dưỡng & Chiêu mộ (Pokémon)
+`QueryPetList`, `QueryPetBag`, `PetOwnedQuery`, `LotteryQuery`, `LotteryConsume`, `UpdatePetLinkInfo`, `QueryJingLingInfo`, `QueryAllTalentInfo`, `DollQuery`, `QueryAvatarTechnologyTree`, `PetResearchQuery`, `PetFreezeQuery`, `PetCoordinationQuery`, `PetSummonQuery`, `PetRuneQuery / PetRuneBagQuery`, `FuNengQuery`, `QiuGuoQuery`, `PokeBallQuery`, `BiggestLevelQuery`.
+
+### 5.5. Nhóm Trang bị, Thú cưỡi & Cổ vật (Equip & Mount)
+`QueryZuoQiList / ZuoQiEquipQuery / ZuoQiSkinQuery`, `RibbonQuery`, `ZBraceletQuery`, `QueryDecorationBag / DecorationGemQuery / DecorationHandbookQuery`, `WishStarQuery / WishStarStarPlateBagQuery`, `RotomQuery`, `StatueShowQuery`, `QueryPortableAmplifierInfos / ItemPortableGuanzhuQuery`, `ZhanZhenQuery`.
+
+### 5.6. Nhóm Bang hội / Doanh trại (Camp & Guild)
+`CampQuery`, `CampTechQuery`, `CampStatueQuery`, `CampHuntQuery`, `CampTrainQuery`, `CampTeamPVEQeury`, `CampGVGQuery`, `CampPetQuery`, `CampMonumentQuery`, `CampFisheryQuery / CampFisheryBagQuery / CampFisheryAchievement`, `CampDonateQuery`, `CampPokeCenterQuery`, `GuildTeamsQuery`, `GlobalGuildWarQuery / GuildRankWarQuery`.
+
+### 5.7. Nhóm PVE, Bản đồ & Phụ bản (Dungeons)
+`QueryBattleRecord`, `QueryTreasureCave / QueryTreasureCaveAward`, `GlobalBossQuery`, `GlobalPetQuery`, `MiJingStatusQuery`, `PetExploreQuery`, `RichnessForestQuery`, `PetExpeditionQuery`, `BattleTowerQuery`, `LeagueTripQuery`, `MirrorChallengeQuery`, `TeamPVEQuery`, `WayOfTrainQuery`, `FieldStrengthQuery`, `UltimateHoleQuery`, `RuinsQuery`, `SecuricarInfoQuery`, `SkyPillarQuery`, `IslandTourQuery`, `PokemonChallengeQuery`, `RefreshGhosts`.
+
+### 5.8. Nhóm Đấu trường PVP & Giải đấu (Arena)
+`PVPStatusQuery`, `PVPRankingTopQuery`, `TopMatchQuery`, `ChampionLeagueQueryTime / ChampionLeagueQueryStatus`, `FightRealtimeQuery`, `TeamPVPQuery`, `PetLeagueQuery`, `PVPPeakBattleQuery / PVPPeakBattleQueryRanking`, `GlobalCompeteStatusQuery`, `AmphitheaterQuery`, `DailyRivalQuery`.
+
+### 5.9. Nhóm Hệ thống Đạo Quán (Gyms)
+`DaoguanInfoQuery`, `DaoguanSkillAwakenQuery`, `DaoguanOwnerQuery` (ID 501-508), `DaoguanGlobalQuery`.
+
+### 5.10. Nhóm Xã hội & Tương tác (Social)
+`FriendQuery`, `FriendHuntQuery`, `InviteReturnQuery`, `SecretBaseQueryPrivate / SecretBaseQueryDetail`, `LuckyDrawQuery`.
+
+---
+
+## PHẦN 6: CODE MẪU THUẬT TOÁN ĐÃ ĐƯỢC CHỨNG MINH (PROOF OF CONCEPT)
+
+### 6.1. Script Python Đóng Gói Header Nhị Phân Lồng CRC32 (Socket Framing)
+```python
+import zlib
+
+def pack_game_packet(flag: int, field_8: int = 0, field_12: int = 0, payload: bytes = b"") -> bytes:
+    """
+    Đóng gói 16-byte Header nhị phân lồng CRC32 theo chuẩn SJ::Net::Message::encode.
+    """
+    total_len = 16 + len(payload)
+    b4_7 = total_len.to_bytes(3, "big") + bytes([flag])
+    b8_15 = field_8.to_bytes(4, "big") + field_12.to_bytes(4, "big")
+
+    # Tầng 1: CRC32 từ byte 4 đến hết payload
+    data_after_4 = b4_7 + b8_15 + payload
+    crc1 = zlib.crc32(data_after_4) & 0xFFFF
+    b2_3 = crc1.to_bytes(2, "big")
+
+    # Tầng 2: CRC32 trên 14 byte Header (byte 2 đến 15)
+    data_2_15 = b2_3 + b4_7 + b8_15
+    crc2 = zlib.crc32(data_2_15) & 0xFFFF
+    b0_1 = crc2.to_bytes(2, "big")
+
+    return b0_1 + b2_3 + b4_7 + b8_15 + payload
+
+# Kiểm chứng Handshake
+hs = pack_game_packet(flag=0x0A, field_8=0, field_12=5, payload=b"")
+print(f"Handshake Hex: {hs.hex()}")
+# Output: 61da39960000100a0000000000000005 (Khớp 100% gói bắt được!)
+```
+
+### 6.2. Script Python Sinh Chữ Ký Login và BindZone Chuẩn
+```python
+import hashlib
+
+SECRET_KEY = "f43968a73df747aab4b9b1e506265050"
+
+def calculate_login_signature(app_id: str, user_name: str, raw_password: str, source: str = "1") -> str:
+    password_hash = hashlib.md5(raw_password.encode('utf-8')).hexdigest().lower()
+    sign_raw = f"{app_id}{user_name}{password_hash}{source}{SECRET_KEY}"
+    return hashlib.md5(sign_raw.encode('utf-8')).hexdigest().lower()
+
+def calculate_bindzone_signature(user_id: str, app_id: str, game_zone_id: str, create_role: str = "1") -> str:
+    sign_raw = f"{user_id}{app_id}{game_zone_id}{create_role}{SECRET_KEY}"
+    return hashlib.md5(sign_raw.encode('utf-8')).hexdigest().lower()
+
+# Kiểm chứng chữ ký BindZone thực tế
+sign_bz = calculate_bindzone_signature("422970893", "10062", "2142", "1")
+print(f"BindZone Sign: {sign_bz}")
+# Output: 70d29a9fba108e81cf5c260c77093692 (Khớp 100% gói tin thực tế!)
+```
+
+### 6.3. Script JavaScript / Node.js (Tạo Chữ Ký Web SDK)
+```javascript
+const crypto = require('crypto');
+
+const SECRET_KEY = "f43968a73df747aab4b9b1e506265050";
+
+function md5(str) {
+    return crypto.createHash('md5').update(str, 'utf8').digest('hex').toLowerCase();
+}
+
+function calculateLoginSign(appId, userName, rawPassword, source = "1") {
+    const passwordHash = md5(rawPassword);
+    return md5(`${appId}${userName}${passwordHash}${source}${SECRET_KEY}`);
+}
+
+function calculateBindZoneSign(userId, appId, gameZoneId, createRole = "1") {
+    return md5(`${userId}${appId}${gameZoneId}${createRole}${SECRET_KEY}`);
+}
+
+console.log("Login Sign:   ", calculateLoginSign("10062", "taikhoandethu999", "ab94285a0b9e7c9b2036c484a6a70c08"));
+console.log("BindZone Sign:", calculateBindZoneSign("422970893", "10062", "2142", "1"));
+```
+
+### 6.4. Script Python Đọc & Xử Lý Gói Tin TCP Stream (Unpack & Zlib Deflate)
+```python
+import socket
+import zlib
+import json
+
+def recv_one_packet(sock: socket.socket, timeout: float = 5.0):
+    """
+    Đọc chính xác 1 khung gói tin nhị phân từ TCP Socket:
+    1. Đọc đủ 16 byte header.
+    2. Trích xuất total_len tại bytes 4..6.
+    3. Đọc vòng lặp stream cho đến khi đủ payload_len.
+    """
+    sock.settimeout(timeout)
+    header = b""
+    while len(header) < 16:
+        chunk = sock.recv(16 - len(header))
+        if not chunk:
+            return None, None
+        header += chunk
+
+    total_len = int.from_bytes(header[4:7], "big")
+    payload_len = total_len - 16
+    payload = b""
+    while len(payload) < payload_len:
+        chunk = sock.recv(payload_len - len(payload))
+        if not chunk:
+            break
+        payload += chunk
+
+    return header, payload
+
+def parse_payload(payload: bytes):
+    """
+    Giải nén Zlib (nếu có) và bóc tách dữ liệu JSON.
+    """
+    if not payload:
+        return None
+    # Nhận diện Zlib Deflate magic bytes 0x78 0x9C hoặc 0x78 0xDA
+    if payload.startswith(b"\x78\x9c") or payload.startswith(b"\x78\xda"):
+        try:
+            payload = zlib.decompress(payload)
+        except Exception:
+            pass
+
+    text = payload.decode("utf-8", errors="ignore")
+    # Bỏ mã trạng thái "0;" ở đầu phản hồi
+    if text.startswith("0;"):
+        text = text[2:]
+
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+```
+
+### 6.5. Script JavaScript / Node.js Đóng Gói Header 16-Byte Lồng CRC32
+```javascript
+/**
+ * Tính CRC32 chuẩn IEEE 802.3 bằng thuần Javascript (Không cần thư viện ngoài)
+ */
+function crc32(buf) {
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < buf.length; i++) {
+        crc ^= buf[i];
+        for (let j = 0; j < 8; j++) {
+            crc = (crc >>> 1) ^ (-(crc & 1) & 0xEDB88320);
+        }
+    }
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+/**
+ * Đóng gói Header nhị phân 16-byte lồng 2 tầng CRC32 theo SJ::Net::Message::encode
+ */
+function packGamePacket(flag, field8 = 0, field12 = 0, payload = Buffer.alloc(0)) {
+    const totalLen = 16 + payload.length;
+
+    // Bytes 4..7: total_len (3 bytes big-endian) + flag (1 byte)
+    const b4_7 = Buffer.alloc(4);
+    b4_7.writeUIntBE(totalLen, 0, 3);
+    b4_7.writeUInt8(flag, 3);
+
+    // Bytes 8..15: field_8 (4 bytes) + field_12 (4 bytes)
+    const b8_15 = Buffer.alloc(8);
+    b8_15.writeUInt32BE(field8, 0);
+    b8_15.writeUInt32BE(field12, 4);
+
+    // Tầng 1: CRC32 từ byte 4 đến hết payload
+    const dataAfter4 = Buffer.concat([b4_7, b8_15, payload]);
+    const crc1 = crc32(dataAfter4) & 0xFFFF;
+    const b2_3 = Buffer.alloc(2);
+    b2_3.writeUInt16BE(crc1, 0);
+
+    // Tầng 2: CRC32 trên 14 byte Header (byte 2..15)
+    const data2_15 = Buffer.concat([b2_3, b4_7, b8_15]);
+    const crc2 = crc32(data2_15) & 0xFFFF;
+    const b0_1 = Buffer.alloc(2);
+    b0_1.writeUInt16BE(crc2, 0);
+
+    return Buffer.concat([b0_1, b2_3, b4_7, b8_15, payload]);
+}
+
+// Kiểm chứng Handshake
+const hsPacket = packGamePacket(0x0A, 0, 5);
+console.log("Handshake Hex:", hsPacket.toString("hex"));
+// Output: 61da39960000100a0000000000000005 (Khớp 100% với Wireshark!)
+```
